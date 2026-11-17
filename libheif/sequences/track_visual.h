@@ -25,6 +25,7 @@
 #include "image/image_description.h"
 #include <string>
 #include <memory>
+#include <optional>
 #include <vector>
 #include <map>
 
@@ -100,6 +101,11 @@ private:
 
   std::shared_ptr<class Decoder> m_active_decoder;
 
+  // Chunk that supplied the most recent sample to m_active_decoder. Used to
+  // attribute a decoder error to the segment that should be skipped.
+  uint32_t m_active_decoder_chunk_idx = 0;
+  bool m_has_active_decoder_chunk = false;
+
   heif_encoder* m_active_encoder = nullptr;
   std::unique_ptr<heif_encoder> m_alpha_track_encoder;
 
@@ -107,6 +113,16 @@ private:
   // its own format only; balances saturate at zero and persist across decode calls.
   std::map<heif_compression_format, uint16_t> m_decode_work_debt;
   bool m_decode_work_limit_exceeded = false;
+
+  // A segment whose compressed data could not be decoded is skipped as a
+  // whole. The remaining input in that chunk is not a valid continuation for
+  // predictive codecs, so decoding resumes at the next chunk.
+  std::optional<uint32_t> m_pending_skip_chunk_idx;
+  void request_skip_damaged_chunk(uint32_t chunk_idx);
+  void skip_damaged_chunk(uint32_t chunk_idx, uint64_t num_output_samples);
+  void release_active_decoder();
+
+  static bool is_segment_local_decode_error(const Error& error);
 
   Result<bool> process_encoded_data(heif_encoder* encoder);
 };

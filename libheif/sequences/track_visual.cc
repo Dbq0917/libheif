@@ -64,6 +64,68 @@ Error sequence_decode_work_limit_error()
 } // namespace
 
 
+bool Track_Visual::is_segment_local_decode_error(const Error& error)
+{
+  // Bitstream and plugin errors are confined to the segment that produced
+  // them. Resource and configuration errors are not: retrying later segments
+  // would either hide a security limit or cannot work without a usable decoder.
+  if (error.error_code == heif_error_Invalid_input) {
+    return error.sub_error_code != heif_suberror_Security_limit_exceeded;
+  }
+
+  return error.error_code == heif_error_Decoder_plugin_error;
+}
+
+
+void Track_Visual::release_active_decoder()
+{
+  if (m_active_decoder) {
+    m_active_decoder->release_decoder();
+  }
+  m_active_decoder.reset();
+  m_decoder_is_flushed = false;
+  m_has_active_decoder_chunk = false;
+}
+
+
+void Track_Visual::request_skip_damaged_chunk(uint32_t chunk_idx)
+{
+  m_pending_skip_chunk_idx = chunk_idx;
+
+  // If the damaged chunk is the one currently feeding the decoder, its codec
+  // state cannot be reused. Drop it now. If the active decoder belongs to an
+  // earlier, intact chunk, keep it alive until its buffered frames have been
+  // drained, so that skipping the damaged segment does not also lose those.
+  if (m_active_decoder && m_has_active_decoder_chunk && m_active_decoder_chunk_idx == chunk_idx) {
+    release_active_decoder();
+  }
+}
+
+
+void Track_Visual::skip_damaged_chunk(uint32_t chunk_idx, uint64_t num_output_samples)
+{
+  if (m_presentation_timeline.empty()) {
+    return;
+  }
+
+  const uint64_t timeline_size = m_presentation_timeline.size();
+
+  // m_next_sample_to_be_decoded and m_next_sample_to_be_output are indices into
+  // the (possibly repeated) presentation timeline. Skip the contiguous run of
+  // entries belonging to the damaged chunk in both. The second run moves the
+  // output position past frames that will never be produced by that chunk.
+  while (m_next_sample_to_be_decoded < num_output_samples &&
+         m_presentation_timeline[m_next_sample_to_be_decoded % timeline_size].chunkIdx == chunk_idx) {
+    m_next_sample_to_be_decoded++;
+  }
+
+  while (m_next_sample_to_be_output < num_output_samples &&
+         m_presentation_timeline[m_next_sample_to_be_output % timeline_size].chunkIdx == chunk_idx) {
+    m_next_sample_to_be_output++;
+  }
+}
+
+
 Track_Visual::Track_Visual(HeifContext* ctx)
   : Track(ctx)
 {
@@ -282,9 +344,40 @@ Result<std::shared_ptr<HeifPixelImage> > Track_Visual::decode_next_image_sample(
   std::shared_ptr<HeifPixelImage> image;
 
   uint32_t sample_idx_in_chunk;
-  uintptr_t decoded_sample_idx = 0; // TODO: map this to sample idx + chunk
+
+  // Filled by the decoder plugin with the sample index passed as user data.
+  // Plugins that do not report it leave the sentinel untouched.
+  uintptr_t decoded_sample_idx = UINTPTR_MAX;
+
+  auto recover_from_segment_error = [&](const Error& error, uint32_t chunk_idx) {
+    // A single-chunk file keeps the historic behavior: a corrupt segment is
+    // reported to the caller instead of silently turning into an empty
+    // sequence. For multi-segment files the corrupt segment is dropped and
+    // decoding resumes after it.
+    if (!is_segment_local_decode_error(error) || m_chunks.size() <= 1) {
+      return false;
+    }
+
+    request_skip_damaged_chunk(chunk_idx);
+    return true;
+  };
 
   for (;;) {
+    if (m_pending_skip_chunk_idx && !m_active_decoder) {
+      const uint32_t damaged_chunk = *m_pending_skip_chunk_idx;
+      m_pending_skip_chunk_idx.reset();
+      skip_damaged_chunk(damaged_chunk, num_output_samples);
+      decoded_sample_idx = UINTPTR_MAX;
+    }
+
+    if (m_next_sample_to_be_output >= num_output_samples) {
+      return Error{
+        heif_error_End_of_sequence,
+        heif_suberror_Unspecified,
+        "End of sequence"
+      };
+    }
+
     const SampleTiming& sampleTiming = m_presentation_timeline[m_next_sample_to_be_decoded % m_presentation_timeline.size()];
     sample_idx_in_chunk = sampleTiming.sampleIdx;
     uint32_t chunk_idx = sampleTiming.chunkIdx;
@@ -316,6 +409,20 @@ Result<std::shared_ptr<HeifPixelImage> > Track_Visual::decode_next_image_sample(
                                                                                                     &decoded_sample_idx,
                                                                                                     m_heif_context->get_security_limits());
       if (getFrameResult.error()) {
+        if (m_pending_skip_chunk_idx) {
+          // A segment is already being dropped. This secondary error only means
+          // that the remaining buffered frames of the previous segment cannot
+          // be recovered; keep the original segment to skip.
+          release_active_decoder();
+          decoded_sample_idx = UINTPTR_MAX;
+          continue;
+        }
+
+        const uint32_t damaged_chunk = m_has_active_decoder_chunk ? m_active_decoder_chunk_idx : chunk_idx;
+        if (recover_from_segment_error(getFrameResult.error(), damaged_chunk)) {
+          decoded_sample_idx = UINTPTR_MAX;
+          continue;
+        }
         return getFrameResult.error();
       }
 
@@ -335,8 +442,19 @@ Result<std::shared_ptr<HeifPixelImage> > Track_Visual::decode_next_image_sample(
         break;
       }
 
-      if ((end_of_input || switching_decoder) && !m_decoder_is_flushed) {
+      if ((end_of_input || switching_decoder || m_pending_skip_chunk_idx) && !m_decoder_is_flushed) {
         if (Error err = m_active_decoder->flush_decoder()) {
+          if (m_pending_skip_chunk_idx) {
+            release_active_decoder();
+            decoded_sample_idx = UINTPTR_MAX;
+            continue;
+          }
+
+          const uint32_t damaged_chunk = m_has_active_decoder_chunk ? m_active_decoder_chunk_idx : chunk_idx;
+          if (recover_from_segment_error(err, damaged_chunk)) {
+            decoded_sample_idx = UINTPTR_MAX;
+            continue;
+          }
           return err;
         }
         m_decoder_is_flushed = true;
@@ -346,14 +464,21 @@ Result<std::shared_ptr<HeifPixelImage> > Track_Visual::decode_next_image_sample(
       // A drained decoder can be replaced at a chunk boundary. At end-of-input,
       // a missing output frame is an error.
       if (m_decoder_is_flushed) {
+        if (m_pending_skip_chunk_idx) {
+          const uint32_t damaged_chunk = *m_pending_skip_chunk_idx;
+          m_pending_skip_chunk_idx.reset();
+          release_active_decoder();
+          skip_damaged_chunk(damaged_chunk, num_output_samples);
+          decoded_sample_idx = UINTPTR_MAX;
+          continue;
+        }
+
         if (end_of_input) {
           return Error(heif_error_Decoder_plugin_error,
                        heif_suberror_Unspecified,
                        "Did not decode all frames");
         }
-        m_active_decoder->release_decoder();
-        m_active_decoder.reset();
-        m_decoder_is_flushed = false;
+        release_active_decoder();
       }
     }
 
@@ -390,11 +515,17 @@ Result<std::shared_ptr<HeifPixelImage> > Track_Visual::decode_next_image_sample(
                                                                                 sample_idx_in_chunk, // user data
                                                                                 m_heif_context->get_security_limits());
       if (decodingError) {
+        if (recover_from_segment_error(decodingError, chunk_idx)) {
+          decoded_sample_idx = UINTPTR_MAX;
+          continue;
+        }
         return decodingError;
       }
 
       decode_work_debt++;
       m_active_decoder = decoder;
+      m_active_decoder_chunk_idx = chunk_idx;
+      m_has_active_decoder_chunk = true;
     }
     else {
       // Not reached: at end of input, there is always an active decoder (we pushed at least one sample)
@@ -450,10 +581,15 @@ Result<std::shared_ptr<HeifPixelImage> > Track_Visual::decode_next_image_sample(
   }
 
   if (m_stts) {
-    // 'sample_idx_in_chunk' follows m_next_sample_to_be_decoded, which runs ahead of the output
-    // by the decoder latency. Look the duration up by the output position instead, like
-    // Track::get_next_sample_raw_data() does.
-    image->set_sample_duration(m_stts->get_sample_duration(outputTiming.sampleIdx));
+    // With frame reordering (e.g. HEVC B-frames), the output position in decoding order
+    // does not match the sample of the decoded frame. Prefer the sample index that the
+    // decoder passed through as user data and fall back to the output position if it is
+    // not available.
+    if (decoded_sample_idx >= m_num_samples) {
+      decoded_sample_idx = outputTiming.sampleIdx;
+    }
+
+    image->set_sample_duration(m_stts->get_sample_duration(static_cast<uint32_t>(decoded_sample_idx)));
   }
 
   // --- assign alpha if we have an assigned alpha track
