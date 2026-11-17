@@ -108,6 +108,13 @@ Result<uint32_t> Decoder_HEVC::get_number_of_coded_pictures(const std::vector<ui
   return count_nal_coded_pictures(compressed_data, heif_compression_HEVC);
 }
 
+uint8_t Decoder_HEVC::get_nal_length_field_size() const
+{
+  // Read from the hvcC of this sample description on every call so a
+  // configuration change on a later chunk is picked up immediately.
+  return m_hvcC->get_configuration().m_length_size;
+}
+
 
 Error Decoder_HEVC::get_coded_image_colorspace(heif_colorspace* out_colorspace, heif_chroma* out_chroma) const
 {

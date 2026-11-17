@@ -20,6 +20,7 @@
 
 #include "codecs/decoder.h"
 
+#include <atomic>
 #include <utility>
 #include "error.h"
 #include "context.h"
@@ -359,6 +360,120 @@ split_nal_units_4byte_length_prefixed(const uint8_t* data, size_t size)
   return units;
 }
 
+namespace {
+
+// Process-wide count of rejected NAL length fields. Internal diagnostic only.
+std::atomic<uint32_t> s_nal_length_field_anomalies{0};
+
+const char* nal_codec_name(heif_compression_format codec)
+{
+  switch (codec) {
+    case heif_compression_AVC:
+      return "AVC";
+    case heif_compression_HEVC:
+      return "HEVC";
+    case heif_compression_VVC:
+      return "VVC";
+    default:
+      return "NAL";
+  }
+}
+
+} // namespace
+
+uint32_t get_nal_length_field_anomaly_count()
+{
+  return s_nal_length_field_anomalies.load(std::memory_order_relaxed);
+}
+
+Result<std::vector<uint8_t>>
+reframe_nal_units_to_4byte_length(const std::vector<uint8_t>& data,
+                                  size_t configuration_data_size,
+                                  uint8_t length_size,
+                                  heif_compression_format codec,
+                                  const char* configuration_box_type)
+{
+  // ISO/IEC 14496-15: lengthSizeMinusOne is a 2-bit field, so the legal
+  // length-field widths are 1, 2 and 4. The value 3 (a 3-byte field) is
+  // reserved and must never appear. Reject it instead of guessing a width.
+  if (length_size != 1 && length_size != 2 && length_size != 4) {
+    s_nal_length_field_anomalies.fetch_add(1, std::memory_order_relaxed);
+    std::ostringstream sstr;
+    sstr << nal_codec_name(codec) << " "
+         << (configuration_box_type ? configuration_box_type : "configuration record")
+         << " declares an unsupported NAL length field width of "
+         << static_cast<int>(length_size) << " bytes (allowed: 1, 2 or 4)";
+    return Error{heif_error_Invalid_input,
+                 heif_suberror_Invalid_parameter_value,
+                 sstr.str()};
+  }
+
+  if (configuration_data_size > data.size()) {
+    s_nal_length_field_anomalies.fetch_add(1, std::memory_order_relaxed);
+    return Error{heif_error_Invalid_input,
+                 heif_suberror_Unspecified,
+                 "Configuration data size exceeds the compressed buffer"};
+  }
+
+  // The common, and previously only supported, case needs no copy at all.
+  // Configuration NALs are always written with 4-byte prefixes, so a 4-byte
+  // width means the whole buffer already has the framing every plugin expects.
+  // Returning the input unchanged keeps the decode output of all existing files
+  // byte-identical.
+  if (length_size == 4) {
+    return data;
+  }
+
+  std::vector<uint8_t> out;
+  out.reserve(data.size());
+
+  // Configuration NALs keep their original 4-byte prefixes.
+  out.insert(out.end(), data.begin(), data.begin() + configuration_data_size);
+
+  size_t ptr = configuration_data_size;
+  while (ptr < data.size()) {
+    if (data.size() - ptr < length_size) {
+      s_nal_length_field_anomalies.fetch_add(1, std::memory_order_relaxed);
+      std::ostringstream sstr;
+      sstr << nal_codec_name(codec) << " sample contains a truncated "
+           << static_cast<int>(length_size) << "-byte NAL length field at offset "
+           << ptr;
+      return Error{heif_error_Invalid_input,
+                   heif_suberror_End_of_data,
+                   sstr.str()};
+    }
+
+    uint32_t nal_size = 0;
+    for (uint8_t i = 0; i < length_size; i++) {
+      nal_size = (nal_size << 8) | data[ptr + i];
+    }
+    ptr += length_size;
+
+    if (nal_size > data.size() - ptr) {
+      s_nal_length_field_anomalies.fetch_add(1, std::memory_order_relaxed);
+      std::ostringstream sstr;
+      sstr << nal_codec_name(codec) << " sample contains a NAL length of "
+           << nal_size << " bytes at offset " << (ptr - length_size)
+           << " that runs past the end of the sample ("
+           << (data.size() - ptr) << " bytes remain)";
+      return Error{heif_error_Invalid_input,
+                   heif_suberror_End_of_data,
+                   sstr.str()};
+    }
+
+    // Rewrite the prefix as a 4-byte big-endian length and keep the payload.
+    out.push_back(static_cast<uint8_t>((nal_size >> 24) & 0xFF));
+    out.push_back(static_cast<uint8_t>((nal_size >> 16) & 0xFF));
+    out.push_back(static_cast<uint8_t>((nal_size >> 8) & 0xFF));
+    out.push_back(static_cast<uint8_t>(nal_size & 0xFF));
+    out.insert(out.end(), data.begin() + ptr, data.begin() + ptr + nal_size);
+
+    ptr += nal_size;
+  }
+
+  return out;
+}
+
 
 Result<uint32_t> count_nal_coded_pictures(const std::vector<uint8_t>& data,
                                           heif_compression_format codec)
@@ -580,6 +695,28 @@ Error Decoder::decode_sequence_frame_from_compressed_data(bool upload_configurat
   Error prepareErr = prepare_compressed_data_for_decoding(*dataResult, configuration_data_size);
   if (prepareErr) {
     return prepareErr;
+  }
+
+  // Reframe the sample bitstream to the 4-byte NAL length prefix every decoder
+  // plugin expects, using the width declared by this sample description's
+  // configuration record. The width is fetched per sample (never cached
+  // globally), so a configuration change or a different track takes effect
+  // immediately. Codecs without length-prefixed NAL units return width 0.
+  const uint8_t nal_length_size = get_nal_length_field_size();
+  if (nal_length_size != 0) {
+    auto reframed = reframe_nal_units_to_4byte_length(*dataResult,
+                                                       configuration_data_size,
+                                                       nal_length_size,
+                                                       get_compression_format(),
+                                                       get_configuration_box_type());
+    if (!reframed) {
+      Error err = reframed.error();
+      // For sequence samples, user_data identifies the sample within its chunk
+      // so an upstream team can locate the exact sample and parameter set.
+      err.message += " (sample index in chunk: " + std::to_string(user_data) + ")";
+      return err;
+    }
+    *dataResult = std::move(*reframed);
   }
 
   // Reject memory-bomb inputs whose coded picture size exceeds libheif's

@@ -52,6 +52,10 @@ public:
   Result<uint32_t> get_number_of_coded_pictures(const std::vector<uint8_t>& compressed_data,
                                                 size_t configuration_data_size) const override;
 
+  uint8_t get_nal_length_field_size() const override;
+
+  const char* get_configuration_box_type() const override { return "hvcC"; }
+
 private:
   const std::shared_ptr<const Box_hvcC> m_hvcC;
 };

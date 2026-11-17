@@ -115,6 +115,14 @@ Result<uint32_t> Decoder_VVC::get_number_of_coded_pictures(const std::vector<uin
   return count_nal_coded_pictures(compressed_data, heif_compression_VVC);
 }
 
+uint8_t Decoder_VVC::get_nal_length_field_size() const
+{
+  // The vvcC stores lengthSizeMinusOne; the field width is that value plus one.
+  // It is re-read on every call, so each track (and each replaced vvcC) keeps
+  // its own, current width instead of sharing a process-wide cached value.
+  return static_cast<uint8_t>(m_vvcC->get_configuration().LengthSizeMinusOne + 1);
+}
+
 
 Error Decoder_VVC::get_coded_image_colorspace(heif_colorspace* out_colorspace, heif_chroma* out_chroma) const
 {

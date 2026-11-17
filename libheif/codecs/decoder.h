@@ -57,6 +57,34 @@ struct ImageSize
 std::vector<std::pair<const uint8_t*, size_t>>
 split_nal_units_4byte_length_prefixed(const uint8_t* data, size_t size);
 
+// Rewrite the length-prefixed NAL units in `data` so that every length field
+// uses the 4-byte big-endian framing all decoder plugins expect.
+//
+// `length_size` is the NAL-unit-length field width declared by the codec
+// configuration record (avcC/hvcC/vvcC, i.e. lengthSizeMinusOne + 1). Only the
+// ISO/IEC 14496-15 values 1, 2 and 4 are legal; any other value is rejected
+// without guessing. The first `configuration_data_size` bytes contain the
+// configuration NALs, which are always emitted with 4-byte prefixes and are
+// therefore copied verbatim; only the sample bitstream behind them is reframed.
+//
+// A length prefix that is truncated, a length that runs past the end of the
+// buffer, or an illegal field width returns an Error and increments the
+// length-field anomaly counter once for the offending sample. The routine is
+// stateless: it validates exactly the one buffer it is given and keeps no
+// position across calls, so streaming one sample at a time stays correct even
+// when the declared width changes between tracks or between sample descriptions.
+Result<std::vector<uint8_t>>
+reframe_nal_units_to_4byte_length(const std::vector<uint8_t>& data,
+                                  size_t configuration_data_size,
+                                  uint8_t length_size,
+                                  heif_compression_format codec,
+                                  const char* configuration_box_type);
+
+// Number of malformed NAL length fields rejected since process start. This is
+// an internal diagnostic only; the public ABI is unchanged. Each rejected
+// sample (not each malformed prefix within it) counts once.
+uint32_t get_nal_length_field_anomaly_count();
+
 // Scan the complete length-prefixed buffer that will be submitted to a NAL
 // decoder. Invalid framing is an error, not a partial picture count.
 Result<uint32_t> count_nal_coded_pictures(const std::vector<uint8_t>& data,
@@ -173,6 +201,18 @@ public:
   {
     return Error::Ok;
   }
+
+  // Width, in bytes, of the NAL-unit length field as declared by the codec
+  // configuration record of the sample description this decoder belongs to.
+  // Returns 0 for codecs whose bitstreams are not length-prefixed (AV1, JPEG,
+  // etc.). The value is read from the configuration record for every sample, so a
+  // configuration change takes effect immediately and different tracks never
+  // share a cached width.
+  [[nodiscard]] virtual uint8_t get_nal_length_field_size() const { return 0; }
+
+  // FourCC of the codec configuration box that declares the length field
+  // width (e.g. "hvcC"), used to name the parameter set in error messages.
+  [[nodiscard]] virtual const char* get_configuration_box_type() const { return ""; }
 
   Result<std::vector<uint8_t>> get_compressed_data(bool with_configuration_NALs,
                                                    size_t* out_configuration_data_size = nullptr) const;

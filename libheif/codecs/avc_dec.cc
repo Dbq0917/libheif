@@ -108,6 +108,14 @@ Result<uint32_t> Decoder_AVC::get_number_of_coded_pictures(const std::vector<uin
   return count_nal_coded_pictures(compressed_data, heif_compression_AVC);
 }
 
+uint8_t Decoder_AVC::get_nal_length_field_size() const
+{
+  // Read from the configuration record of this sample description on every
+  // call: a replacement avcC (e.g. on a new chunk) changes the width without
+  // any global cache becoming stale.
+  return m_avcC->get_configuration().lengthSize;
+}
+
 
 Error Decoder_AVC::get_coded_image_colorspace(heif_colorspace* out_colorspace, heif_chroma* out_chroma) const
 {
